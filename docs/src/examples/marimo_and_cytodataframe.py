@@ -1,5 +1,6 @@
 # marimo manages cell signatures and cell-local imports.
 # ruff: noqa: ANN001, ANN201, PLC0415, PLR0913, PLR0917, PLR1711
+
 import marimo
 
 __generated_with = "0.25.2"
@@ -37,11 +38,12 @@ def introduction(mo):
     uv run --with marimo==0.25.2 marimo edit docs/src/examples/marimo_and_cytodataframe.py
     ```
 
-    This example uses `mo.Html(frame._repr_html_(debug=True))` to display the
-    image table, rather than CytoDataFrame's Jupyter ipywidgets output.
-    marimo controls rebuild the table when their values change. This is an
-    explicit HTML bridge, not native ipywidgets support. The 3D sections use
-    an interactive browser renderer and save PyVista PNGs for GitHub. The
+    This example uses `mo.ui.dataframe` for native sorting, filtering, and
+    dataframe transformations. Original filenames and measurements remain in
+    the dataframe; adjacent preview columns use `format_mapping` to display
+    CytoDataFrame's image crops, composites, and 3D viewers. marimo controls
+    rebuild the viewer when their values change. The 3D sections use an
+    interactive browser renderer and save PyVista PNGs for GitHub. The
     documentation snapshot shows the default values; changing the controls
     requires the running marimo notebook.
     """)
@@ -75,7 +77,14 @@ def controls(mo):
 
 @app.cell
 def image_table(
-    CytoDataFrame, brightness, composite, mo, outlines, row_count, sample_dir
+    CytoDataFrame,
+    brightness,
+    composite,
+    make_dataframe,
+    mo,
+    outlines,
+    row_count,
+    sample_dir,
 ):
     frame = CytoDataFrame(
         data=sample_dir / "BR00117006_shrunken.parquet",
@@ -98,19 +107,20 @@ def image_table(
         ]
     ][: row_count.value]
     table_html = frame._repr_html_(debug=True)
+    image_viewer = make_dataframe(frame, table_html)
     mo.vstack(
         [
             mo.md(
                 f"Showing **{len(frame)} cells**, brightness **{brightness.value}**."
             ),
-            mo.Html(table_html),
+            image_viewer,
         ]
     )
-    return frame, table_html
+    return
 
 
 @app.cell
-def reference_paths(pathlib, sample_dir):
+def reference_paths(sample_dir):
     jump_data_path = str(sample_dir)
     nf1_cellpainting_path = str(sample_dir.parent / "NF1_cellpainting_data_shrunken")
     nuclear_speckles_path = str(sample_dir.parent / "nuclear_speckles")
@@ -121,17 +131,17 @@ def reference_paths(pathlib, sample_dir):
         sample_dir.parent.parent / "CP_tutorial_3D_noise_nuclei_segmentation"
     )
     return (
+        cp_3d_path,
         jump_data_path,
         nf1_cellpainting_path,
         nuclear_speckles_path,
         pediatric_cancer_atlas_path,
-        cp_3d_path,
     )
 
 
 @app.cell
 def rendering(CytoDataFrame, pd):
-    def render_frame(frame: "CytoDataFrame") -> str:
+    def render_frame(frame: CytoDataFrame) -> str:
         # marimo changes pandas display defaults. Keep the reference notebook's
         # limits so the 25-row texture example is not silently truncated.
         with pd.option_context("display.max_rows", 60, "display.max_columns", 0):
@@ -143,7 +153,125 @@ def rendering(CytoDataFrame, pd):
 
 
 @app.cell
-def example_02(CytoDataFrame, jump_data_path, mo, render_frame):
+def native_dataframes(CytoDataFrame, mo, pd, static_3d):
+    # The generated Python cell wrapper combines these helper methods.
+    # ruff: noqa: C901, RUF100
+    from html import unescape
+    from html.parser import HTMLParser
+
+    class ImageCells(HTMLParser):
+        """Read image cells without decoding or changing CytoDataFrame's pixels."""
+
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=False)
+            self.columns = []
+            self.rows = []
+            self._header = False
+            self._body = False
+            self._row = []
+            self._cell = None
+
+        def handle_starttag(
+            self,
+            tag: str,
+            attrs: list[tuple[str, str | None]],
+        ) -> None:
+            if tag == "thead":
+                self._header = True
+            elif tag == "tbody":
+                self._body = True
+            elif tag == "tr":
+                self._row = []
+            elif (self._header and tag == "th") or (self._body and tag == "td"):
+                self._cell = []
+            elif self._cell is not None:
+                self._cell.append(self.get_starttag_text())
+
+        def handle_startendtag(
+            self,
+            tag: str,
+            attrs: list[tuple[str, str | None]],
+        ) -> None:
+            if self._cell is not None:
+                self._cell.append(self.get_starttag_text())
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in ("td", "th") and self._cell is not None:
+                self._row.append("".join(self._cell))
+                self._cell = None
+            elif tag == "tr":
+                if self._header:
+                    self.columns = [unescape(value) for value in self._row[1:]]
+                elif self._body:
+                    self.rows.append(self._row)
+            elif tag == "thead":
+                self._header = False
+            elif tag == "tbody":
+                self._body = False
+            elif self._cell is not None:
+                self._cell.append(f"</{tag}>")
+
+        def handle_data(self, data: str) -> None:
+            if self._cell is not None:
+                self._cell.append(data)
+
+        def handle_entityref(self, name: str) -> None:
+            self.handle_data(f"&{name};")
+
+        def handle_charref(self, name: str) -> None:
+            self.handle_data(f"&#{name};")
+
+    def make_dataframe(frame: CytoDataFrame, snapshot_html: str) -> object:
+        """Add image previews while preserving source values and numeric dtypes."""
+        if static_3d:
+            return mo.Html(snapshot_html)
+        parser = ImageCells()
+        parser.feed(snapshot_html)
+        data = pd.DataFrame(frame).copy()
+        data.columns = data.columns.map(str)
+        if frame._custom_attrs.get("is_transposed"):
+            data.insert(0, "Feature", data.index.map(str))
+        data = data.reset_index(drop=True)
+        format_mapping = {}
+        legend = snapshot_html.partition("<table")[0].split("</style>")[-1]
+        composite_column = (frame._custom_attrs.get("display_options") or {}).get(
+            "composite_column_name", "Image_Composite"
+        )
+        if len(parser.rows) != len(data):
+            raise ValueError("The image snapshot must contain every dataframe row")
+        for position, column in enumerate(parser.columns):
+            images = [row[position] for row in parser.rows]
+            if not any("<img" in value for value in images):
+                continue
+            if column == composite_column:
+                images = [legend + image for image in images]
+            preview = f"{column} preview"
+            while preview in data.columns:
+                preview += " preview"
+            location = (
+                data.columns.get_loc(column) + 1
+                if column in data
+                else len(data.columns)
+            )
+            data.insert(location, preview, [str(row) for row in range(len(data))])
+            # A filename can repeat for different object crops. Keep a stable
+            # source-row position so transforms cannot attach the wrong image.
+            format_mapping[preview] = lambda row, images=images: mo.Html(
+                images[int(row)] if "<img" in images[int(row)] else ""
+            )
+        return mo.ui.dataframe(data, format_mapping=format_mapping, page_size=5)
+
+    return (make_dataframe,)
+
+
+@app.cell
+def example_02(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     _frame = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -162,14 +290,20 @@ def example_02(CytoDataFrame, jump_data_path, mo, render_frame):
     mo.vstack(
         [
             mo.md("## 1. JUMP image crops\n\nview JUMP plate BR00117006 with images"),
-            mo.Html(html_02),
+            make_dataframe(frame_02, html_02),
         ]
     )
-    return frame_02, html_02
+    return
 
 
 @app.cell
-def example_03(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_03(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     _frame = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -195,14 +329,20 @@ def example_03(CytoDataFrame, jump_data_path, mo, render_frame):
             segmentation
             """
             ),
-            mo.Html(html_03),
+            make_dataframe(frame_03, html_03),
         ]
     )
-    return frame_03, html_03
+    return (frame_03,)
 
 
 @app.cell
-def example_04(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_04(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_04 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -229,14 +369,20 @@ def example_04(CytoDataFrame, jump_data_path, mo, render_frame):
             (default is green).
             """
             ),
-            mo.Html(html_04),
+            make_dataframe(frame_04, html_04),
         ]
     )
-    return frame_04, html_04
+    return
 
 
 @app.cell
-def example_05(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_05(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_05 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -272,14 +418,20 @@ def example_05(CytoDataFrame, jump_data_path, mo, render_frame):
             the pixels displayed.
             """
             ),
-            mo.Html(html_05),
+            make_dataframe(frame_05, html_05),
         ]
     )
-    return frame_05, html_05
+    return
 
 
 @app.cell
-def example_06(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_06(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_06 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -316,14 +468,20 @@ def example_06(CytoDataFrame, jump_data_path, mo, render_frame):
             result.
             """
             ),
-            mo.Html(html_06),
+            make_dataframe(frame_06, html_06),
         ]
     )
-    return frame_06, html_06
+    return
 
 
 @app.cell
-def example_07(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_07(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_07 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -349,14 +507,20 @@ def example_07(CytoDataFrame, jump_data_path, mo, render_frame):
             represents.
             """
             ),
-            mo.Html(html_07),
+            make_dataframe(frame_07, html_07),
         ]
     )
-    return frame_07, html_07
+    return
 
 
 @app.cell
-def example_08(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_08(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_08 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -387,14 +551,20 @@ def example_08(CytoDataFrame, jump_data_path, mo, render_frame):
             outline easy to distinguish).
             """
             ),
-            mo.Html(html_08),
+            make_dataframe(frame_08, html_08),
         ]
     )
-    return frame_08, html_08
+    return
 
 
 @app.cell
-def example_09(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_09(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_09 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -418,14 +588,20 @@ def example_09(CytoDataFrame, jump_data_path, mo, render_frame):
             view JUMP plate BR00117006 with images and adjust the brightness
             """
             ),
-            mo.Html(html_09),
+            make_dataframe(frame_09, html_09),
         ]
     )
-    return frame_09, html_09
+    return
 
 
 @app.cell
-def example_10(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_10(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_10 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -451,14 +627,20 @@ def example_10(CytoDataFrame, jump_data_path, mo, render_frame):
             segmentation and removing the optional red center dot.
             """
             ),
-            mo.Html(html_10),
+            make_dataframe(frame_10, html_10),
         ]
     )
-    return frame_10, html_10
+    return
 
 
 @app.cell
-def example_11(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_11(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_11 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -483,14 +665,20 @@ def example_11(CytoDataFrame, jump_data_path, mo, render_frame):
             view JUMP plate BR00117006 with images and change the display width
             """
             ),
-            mo.Html(html_11),
+            make_dataframe(frame_11, html_11),
         ]
     )
-    return frame_11, html_11
+    return
 
 
 @app.cell
-def example_12(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_12(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_12 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -516,14 +704,22 @@ def example_12(CytoDataFrame, jump_data_path, mo, render_frame):
             width and also transpose for a different view of things.
             """
             ),
-            mo.Html(html_12),
+            make_dataframe(frame_12, html_12),
         ]
     )
-    return frame_12, html_12
+    return
 
 
 @app.cell
-def example_13(CytoDataFrame, TemporaryDirectory, frame_03, mo, pathlib, render_frame):
+def example_13(
+    CytoDataFrame,
+    TemporaryDirectory,
+    frame_03,
+    make_dataframe,
+    mo,
+    pathlib,
+    render_frame,
+):
     with TemporaryDirectory() as _directory:
         _path = pathlib.Path(_directory) / "example.ome.parquet"
         frame_03.to_ome_parquet(file_path=str(_path))
@@ -539,14 +735,20 @@ def example_13(CytoDataFrame, TemporaryDirectory, frame_03, mo, pathlib, render_
             images as values within the table.
             """
             ),
-            mo.Html(html_13),
+            make_dataframe(frame_13, html_13),
         ]
     )
-    return frame_13, html_13
+    return
 
 
 @app.cell
-def example_14(CytoDataFrame, jump_data_path, mo, render_frame):
+def example_14(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    render_frame,
+):
     frame_14 = CytoDataFrame(
         data=f"{jump_data_path}/BR00117006_shrunken.parquet",
         data_context_dir=f"{jump_data_path}/images/orig",
@@ -579,14 +781,21 @@ def example_14(CytoDataFrame, jump_data_path, mo, render_frame):
             using offsets so each image has roughly the same size.
             """
             ),
-            mo.Html(html_14),
+            make_dataframe(frame_14, html_14),
         ]
     )
-    return frame_14, html_14
+    return
 
 
 @app.cell
-def example_15(CytoDataFrame, jump_data_path, mo, pd, render_frame):
+def example_15(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    pd,
+    render_frame,
+):
     _jump_without_bounding_boxes = pd.read_parquet(
         f"{jump_data_path}/BR00117006_shrunken.parquet"
     )
@@ -631,14 +840,21 @@ def example_15(CytoDataFrame, jump_data_path, mo, pd, render_frame):
             compartment center coordinates.
             """
             ),
-            mo.Html(html_15),
+            make_dataframe(frame_15, html_15),
         ]
     )
-    return frame_15, html_15
+    return
 
 
 @app.cell
-def example_16(CytoDataFrame, jump_data_path, mo, pd, render_frame):
+def example_16(
+    CytoDataFrame,
+    jump_data_path,
+    make_dataframe,
+    mo,
+    pd,
+    render_frame,
+):
     _jump_image_level = pd.read_parquet(f"{jump_data_path}/BR00117006_shrunken.parquet")
     _jump_image_level = _jump_image_level.drop(
         columns=[
@@ -672,14 +888,20 @@ def example_16(CytoDataFrame, jump_data_path, mo, pd, render_frame):
             render_whole_image to display the full field of view without cropping.
             """
             ),
-            mo.Html(html_16),
+            make_dataframe(frame_16, html_16),
         ]
     )
-    return frame_16, html_16
+    return
 
 
 @app.cell
-def example_17(CytoDataFrame, mo, nf1_cellpainting_path, render_frame):
+def example_17(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    nf1_cellpainting_path,
+    render_frame,
+):
     frame_17 = CytoDataFrame(
         data=f"{nf1_cellpainting_path}/Plate_2_with_image_data_shrunken.parquet",
         data_context_dir=f"{nf1_cellpainting_path}/Plate_2_images",
@@ -698,14 +920,20 @@ def example_17(CytoDataFrame, mo, nf1_cellpainting_path, render_frame):
             mo.md(
                 "## 16. NF1 Cell Painting\n\nview NF1 Cell Painting data with images"
             ),
-            mo.Html(html_17),
+            make_dataframe(frame_17, html_17),
         ]
     )
-    return frame_17, html_17
+    return
 
 
 @app.cell
-def example_18(CytoDataFrame, mo, nf1_cellpainting_path, render_frame):
+def example_18(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    nf1_cellpainting_path,
+    render_frame,
+):
     _frame = CytoDataFrame(
         data=f"{nf1_cellpainting_path}/Plate_2_with_image_data_shrunken.parquet",
         data_context_dir=f"{nf1_cellpainting_path}/Plate_2_images",
@@ -731,14 +959,22 @@ def example_18(CytoDataFrame, mo, nf1_cellpainting_path, render_frame):
             masks
             """
             ),
-            mo.Html(html_18),
+            make_dataframe(frame_18, html_18),
         ]
     )
-    return frame_18, html_18
+    return (frame_18,)
 
 
 @app.cell
-def example_19(CytoDataFrame, mo, nf1_cellpainting_path, pathlib, pd, render_frame):
+def example_19(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    nf1_cellpainting_path,
+    pathlib,
+    pd,
+    render_frame,
+):
     _parquet_path = f"{nf1_cellpainting_path}/Plate_2_with_image_data_shrunken.parquet"
     _nf1_dataset_with_modified_image_paths = pd.read_parquet(path=_parquet_path)
     _nf1_dataset_with_modified_image_paths.loc[
@@ -770,14 +1006,22 @@ def example_19(CytoDataFrame, mo, nf1_cellpainting_path, pathlib, pd, render_fra
             used to analyze the data.
             """
             ),
-            mo.Html(html_19),
+            make_dataframe(frame_19, html_19),
         ]
     )
-    return frame_19, html_19
+    return
 
 
 @app.cell
-def example_20(CytoDataFrame, TemporaryDirectory, frame_18, mo, pathlib, render_frame):
+def example_20(
+    CytoDataFrame,
+    TemporaryDirectory,
+    frame_18,
+    make_dataframe,
+    mo,
+    pathlib,
+    render_frame,
+):
     with TemporaryDirectory() as _directory:
         _path = pathlib.Path(_directory) / "example.ome.parquet"
         frame_18.to_ome_parquet(file_path=str(_path))
@@ -793,14 +1037,20 @@ def example_20(CytoDataFrame, TemporaryDirectory, frame_18, mo, pathlib, render_
             images as values within the table.
             """
             ),
-            mo.Html(html_20),
+            make_dataframe(frame_20, html_20),
         ]
     )
-    return frame_20, html_20
+    return
 
 
 @app.cell
-def example_21(CytoDataFrame, mo, nuclear_speckles_path, render_frame):
+def example_21(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    nuclear_speckles_path,
+    render_frame,
+):
     frame_21 = CytoDataFrame(
         data=f"{nuclear_speckles_path}/test_slide1_converted.parquet",
         data_context_dir=f"{nuclear_speckles_path}/images/plate1",
@@ -825,14 +1075,20 @@ def example_21(CytoDataFrame, mo, nuclear_speckles_path, render_frame):
             masks
             """
             ),
-            mo.Html(html_21),
+            make_dataframe(frame_21, html_21),
         ]
     )
-    return frame_21, html_21
+    return
 
 
 @app.cell
-def example_22(CytoDataFrame, mo, nuclear_speckles_path, render_frame):
+def example_22(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    nuclear_speckles_path,
+    render_frame,
+):
     frame_22 = CytoDataFrame(
         data=f"{nuclear_speckles_path}/test_slide1_converted.parquet",
         data_context_dir=f"{nuclear_speckles_path}/images/plate1",
@@ -860,10 +1116,10 @@ def example_22(CytoDataFrame, mo, nuclear_speckles_path, render_frame):
             "Nuclei_Texture_Variance_DAPI_3_03_256".
             """
             ),
-            mo.Html(html_22),
+            make_dataframe(frame_22, html_22),
         ]
     )
-    return frame_22, html_22
+    return (frame_22,)
 
 
 @app.cell
@@ -882,7 +1138,13 @@ def texture_control(frame_22, mo):
 
 
 @app.cell
-def filtered_speckles(frame_22, mo, render_frame, texture_range):
+def filtered_speckles(
+    frame_22,
+    make_dataframe,
+    mo,
+    render_frame,
+    texture_range,
+):
     _lower, _upper = texture_range.value
     filtered_frame = frame_22[
         frame_22["Nuclei_Texture_Variance_DAPI_3_03_256"].between(_lower, _upper)
@@ -894,14 +1156,20 @@ def filtered_speckles(frame_22, mo, render_frame, texture_range):
                 f"Filtered nuclear speckles: **{len(filtered_frame)} / "
                 f"{len(frame_22)} cells**"
             ),
-            mo.Html(filtered_html),
+            make_dataframe(filtered_frame, filtered_html),
         ]
     )
-    return filtered_frame, filtered_html
+    return
 
 
 @app.cell
-def example_23(CytoDataFrame, mo, pediatric_cancer_atlas_path, render_frame):
+def example_23(
+    CytoDataFrame,
+    make_dataframe,
+    mo,
+    pediatric_cancer_atlas_path,
+    render_frame,
+):
     _cdf = CytoDataFrame(
         data=f"{pediatric_cancer_atlas_path}/BR00143976_shrunken.parquet",
         data_context_dir=f"{pediatric_cancer_atlas_path}/images/orig",
@@ -929,14 +1197,14 @@ def example_23(CytoDataFrame, mo, pediatric_cancer_atlas_path, render_frame):
             view ALSF pediatric cancer atlas plate BR00143976 with images
             """
             ),
-            mo.Html(html_23),
+            make_dataframe(frame_23, html_23),
         ]
     )
-    return frame_23, html_23
+    return (frame_23,)
 
 
 @app.cell
-def example_24(frame_23, mo, render_frame):
+def example_24(frame_23, make_dataframe, mo, render_frame):
     frame_24 = frame_23
     html_24 = render_frame(frame_24)
     mo.vstack(
@@ -949,14 +1217,22 @@ def example_24(frame_23, mo, render_frame):
             reference.
             """
             ),
-            mo.Html(html_24),
+            make_dataframe(frame_24, html_24),
         ]
     )
-    return frame_24, html_24
+    return
 
 
 @app.cell
-def example_25(CytoDataFrame, TemporaryDirectory, frame_23, mo, pathlib, render_frame):
+def example_25(
+    CytoDataFrame,
+    TemporaryDirectory,
+    frame_23,
+    make_dataframe,
+    mo,
+    pathlib,
+    render_frame,
+):
     with TemporaryDirectory() as _directory:
         _path = pathlib.Path(_directory) / "example.ome.parquet"
         frame_23.to_ome_parquet(file_path=str(_path))
@@ -972,22 +1248,34 @@ def example_25(CytoDataFrame, TemporaryDirectory, frame_23, mo, pathlib, render_
             images as values within the table.
             """
             ),
-            mo.Html(html_25),
+            make_dataframe(frame_25, html_25),
         ]
     )
-    return frame_25, html_25
+    return
 
 
 @app.cell
-def interactive_rendering(CytoDataFrame, mo, pathlib, pd):
+def interactive_rendering(CytoDataFrame, make_dataframe, mo, pathlib, pd):
     import numpy as np
 
     from cytodataframe.volume import build_3d_image_html_view
 
-    def make_3d_table(frame: "CytoDataFrame", label_opacity: float = 0.35) -> str:
+    def make_3d_table(frame: CytoDataFrame, label_opacity: float = 0.35) -> object:
+        """Render only the requested page's volumes in a native dataframe."""
         table = pd.DataFrame(frame).copy()
+        format_mapping = {}
         for column in frame._find_3d_columns_for_display():
-            for row in frame.index:
+            preview = f"{column} preview"
+            while preview in table.columns:
+                preview += " preview"
+            table.insert(
+                table.columns.get_loc(column) + 1,
+                preview,
+                [str(row) for row in range(len(frame))],
+            )
+
+            def render_volume(position: str, column: str = column) -> object:
+                row = frame.index[int(position)]
                 volume, dims = frame._get_3d_volume_from_cell(row, column)
                 labels = frame._get_3d_label_overlay_from_cell(
                     row, column, expected_shape=volume.shape
@@ -1017,27 +1305,31 @@ def interactive_rendering(CytoDataFrame, mo, pathlib, pd):
                     },
                     label_volume=labels,
                 )
-                # mo.Html does not execute scripts; each viewer needs an iframe.
-                table.loc[row, column] = mo.iframe(
-                    document, width="320px", height="320px"
-                ).text
-        return table.to_html(escape=False)
+                # Return the rich object so dataframe cells can render its MIME.
+                return mo.iframe(document, width="320px", height="320px")
+
+            format_mapping[preview] = render_volume
+        return mo.ui.dataframe(
+            table.reset_index(drop=True), format_mapping=format_mapping, page_size=3
+        )
 
     def show_volume_table(
-        frame: "CytoDataFrame", snapshot: str, opacity: float, static: bool
+        frame: CytoDataFrame, snapshot: str, opacity: float, static: bool
     ) -> object:
         if static:
-            return mo.Html(snapshot)
+            return make_dataframe(frame, snapshot)
         # VTK/Cocoa cannot create windows on marimo's worker thread. Only
         # the standalone export process may generate native PNG snapshots.
-        return mo.Html(make_3d_table(frame, label_opacity=opacity))
+        return make_3d_table(frame, label_opacity=opacity)
 
-    return make_3d_table, show_volume_table
+    return (show_volume_table,)
 
 
 @app.cell
 def render_mode(mo):
-    static_3d = bool(mo.cli_args().get("static-3d"))
+    static_3d = (
+        bool(mo.cli_args().get("static-3d")) if mo.running_in_notebook() else False
+    )
     return (static_3d,)
 
 
@@ -1082,6 +1374,9 @@ def example_26(
     )
     frame_26 = _cdf[["ImageNumber", "ObjectNumber", "FileName_Nuclei"]][:3]
     html_26 = render_frame(frame_26) if static_3d else ""
+    volume_viewer_26 = show_volume_table(
+        frame_26, html_26, label_opacity.value, static_3d
+    )
     mo.vstack(
         [
             mo.md(
@@ -1092,10 +1387,10 @@ def example_26(
             for visualization.
             """
             ),
-            show_volume_table(frame_26, html_26, label_opacity.value, static_3d),
+            volume_viewer_26,
         ]
     )
-    return frame_26, html_26
+    return
 
 
 @app.cell
@@ -1116,6 +1411,9 @@ def example_27(
     )
     frame_27 = _cdf[["ImageNumber", "ObjectNumber", "FileName_Nuclei"]][:3]
     html_27 = render_frame(frame_27) if static_3d else ""
+    volume_viewer_27 = show_volume_table(
+        frame_27, html_27, label_opacity.value, static_3d
+    )
     mo.vstack(
         [
             mo.md(
@@ -1126,10 +1424,10 @@ def example_27(
             are also 3D.
             """
             ),
-            show_volume_table(frame_27, html_27, label_opacity.value, static_3d),
+            volume_viewer_27,
         ]
     )
-    return frame_27, html_27
+    return
 
 
 if __name__ == "__main__":
