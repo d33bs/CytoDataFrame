@@ -10,13 +10,14 @@ import json
 import pathlib
 import re
 import runpy
-from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+from marimo._plugins.ui._impl.table import SearchTableArgs, SortArgs
 from PIL import Image
 
 from cytodataframe.frame import CytoDataFrame
@@ -50,6 +51,9 @@ def test_marimo_image_table(
     assert html.count("<img") == rows * (3 if composite else 2)
     assert "Image_Composite" in html if composite else "Image_Composite" not in html
     _assert_embedded_images(html)
+    previews = _preview_html(definitions["image_viewer"])
+    _assert_embedded_images(previews)
+    assert ("Composite colors:" in previews) == composite
 
 
 def _assert_embedded_images(html: str) -> None:
@@ -58,6 +62,106 @@ def _assert_embedded_images(html: str) -> None:
     for encoded in images:
         with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
             image.verify()
+
+
+def _preview_html(viewer: object, **search: object) -> str:
+    """Fetch rich cells through the same endpoint as the dataframe frontend."""
+    response = viewer._search(SearchTableArgs(page_size=100, page_number=0, **search))
+    return "".join(
+        value["data"]
+        for row in json.loads(response.data)
+        for column, value in row.items()
+        if column.endswith(" preview") and isinstance(value, dict)
+    )
+
+
+def _iframe_documents(html: str) -> str:
+    class Frames(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.documents = []
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag == "iframe":
+                self.documents.append(dict(attrs)["srcdoc"])
+
+    parser = Frames()
+    parser.feed(html)
+    return "".join(parser.documents)
+
+
+def test_native_dataframe_preserves_source_values_and_pixels(notebook: dict):
+    _, definitions = notebook["image_table"].run()
+    viewer = definitions["image_viewer"]
+    original = pd.DataFrame(definitions["frame"])
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(viewer.value[original.columns]), original
+    )
+    html = _preview_html(viewer)
+    image_pattern = r"data:image/[^;]+;base64,([^\"']+)"
+    assert re.findall(image_pattern, html) == re.findall(
+        image_pattern, definitions["table_html"]
+    )
+    _assert_embedded_images(html)
+
+
+def test_native_previews_follow_sorting_and_repeated_filenames(notebook: dict):
+    _, definitions = notebook["image_table"].run()
+    viewer = definitions["image_viewer"]
+    source_column = "Image_FileName_OrigDNA"
+    preview_column = f"{source_column} preview"
+    original = viewer.value
+    assert original[source_column].nunique() < len(original)
+    response = viewer._search(
+        SearchTableArgs(
+            page_size=1,
+            page_number=0,
+            sort=[SortArgs(by="Cells_Number_Object_Number", descending=True)],
+        )
+    )
+    row = json.loads(response.data)[0]
+    expected = original.sort_values("Cells_Number_Object_Number", ascending=False).iloc[
+        0
+    ]
+    assert row[source_column] == expected[source_column]
+    assert (
+        row[preview_column]["data"]
+        == viewer._format_mapping[preview_column](expected[preview_column]).text
+    )
+
+
+def test_native_transposed_dataframe_preserves_feature_names(notebook: dict):
+    _, definitions = notebook["example_12"].run()
+    _, helpers = notebook["native_dataframes"].run()
+    viewer = helpers["make_dataframe"](definitions["frame_12"], definitions["html_12"])
+    assert viewer.value["Feature"].tolist() == definitions["frame_12"].index.tolist()
+    assert "<img" in _preview_html(viewer)
+
+
+def test_native_dataframe_filter_keeps_measurements_and_preview_ids(notebook: dict):
+    _, definitions = notebook["image_table"].run()
+    viewer = definitions["image_viewer"]
+    source = viewer.value
+    column = "Cells_Number_Object_Number"
+    cutoff = source[column].median()
+    result = viewer._convert_value(
+        {
+            "transforms": [
+                {
+                    "type": "filter_rows",
+                    "operation": "keep_rows",
+                    "where": [{"column_id": column, "operator": ">", "value": cutoff}],
+                }
+            ]
+        }
+    )
+    assert viewer._error is None
+    expected = source[source[column] > cutoff]
+    assert 0 < len(result) < len(source)
+    pd.testing.assert_frame_equal(
+        pd.DataFrame(result).reset_index(drop=True),
+        pd.DataFrame(expected).reset_index(drop=True),
+    )
 
 
 def test_marimo_controls_change_pixels(notebook: dict):
@@ -172,7 +276,8 @@ def test_marimo_texture_filter(notebook: dict):
     values = original["Nuclei_Texture_Variance_DAPI_3_03_256"]
     lower, upper = float(values.median()), float(values.max())
     _, filtered = notebook["filtered_speckles"].run(
-        frame_22=original, texture_range=SimpleNamespace(value=(lower, upper))
+        frame_22=original,
+        texture_range=SimpleNamespace(value=(lower, upper)),
     )
     frame = filtered["filtered_frame"]
     assert 0 < len(frame) < len(original)
@@ -182,15 +287,16 @@ def test_marimo_texture_filter(notebook: dict):
 
 @pytest.mark.parametrize("cell_index", [26, 27])
 def test_marimo_interactive_3d(notebook: dict, cell_index: int):
-    _, definitions = notebook[f"example_{cell_index}"].run(static_3d=True)
+    _, definitions = notebook[f"example_{cell_index}"].run()
     _, renderer = notebook["interactive_rendering"].run()
-    html = renderer["make_3d_table"](definitions[f"frame_{cell_index}"])
+    viewer = renderer["make_3d_table"](definitions[f"frame_{cell_index}"])
+    html = _preview_html(viewer)
     assert html.count("<iframe") == 3
     assert "data-volume" in html
     assert "vtk.js@34.9.1" in html
-    assert "data-volume-cmap=&quot;gray&quot;" in html
-    assert "data-volume-background=&quot;0.000000,0.000000,0.000000&quot;" in html
-    documents = unescape(html)
+    documents = _iframe_documents(html)
+    assert 'data-volume-cmap="gray"' in documents
+    assert 'data-volume-background="0.000000,0.000000,0.000000"' in documents
     payloads = re.findall(r'data-volume="([^"]+)"', documents)
     overlays = re.findall(r'data-label-volume="([^"]*)"', documents)
     assert len(payloads) == 3
@@ -223,11 +329,13 @@ def test_live_3d_never_invokes_native_snapshot(notebook: dict, cell_index: int):
     def forbidden_snapshot(frame: CytoDataFrame) -> str:
         pytest.fail("Live marimo must not create a native VTK render window")
 
-    output, definitions = notebook[f"example_{cell_index}"].run(
+    _, definitions = notebook[f"example_{cell_index}"].run(
         static_3d=False, render_frame=forbidden_snapshot
     )
     assert definitions[f"html_{cell_index}"] == ""
-    assert output.text.count("<iframe") == 3
+    assert (
+        _preview_html(definitions[f"volume_viewer_{cell_index}"]).count("<iframe") == 3
+    )
 
 
 def test_marimo_docs_snapshot():

@@ -29,15 +29,22 @@ uv run --with marimo==0.25.2 marimo export ipynb \
 uv run --with ruff==0.16.10 ruff format docs/src/examples/marimo_and_cytodataframe.ipynb
 ```
 
-This example uses an explicit HTML bridge, not CytoDataFrame's Jupyter widgets.
+This example uses marimo's native `mo.ui.dataframe` viewer for sorting,
+filtering, and dataframe transformations. Original filenames and numeric
+measurements are preserved; adjacent preview columns use `format_mapping` to
+show CytoDataFrame's image crops and composites. Preview IDs stay attached to
+their source objects when rows are reordered, including repeated filenames.
+The transposed example retains its feature names in a `Feature` column.
+
 Live 3D uses CytoDataFrame's vtk.js renderer inside iframes; it requires CDN
 access and uses grayscale-on-black, percentile-normalized uint8 intensities and
 a binary green mask overlay. Each masked image has an independent **Show mask**
 checkbox, which preserves its camera and leaves the other images unchanged.
 It supports rotation and zoom, but does not reproduce PyVista's
 per-object label colors, center marker, or full toolbar. The saved notebook
-uses PyVista PNGs for both 3D examples so GitHub and the docs do not need
-JavaScript or a running Python process. Those PNGs are generated only by the
+uses the original static image tables, including PyVista PNGs for both 3D
+examples, so GitHub and the docs do not need JavaScript or a running Python
+process. Those PNGs are generated only by the
 standalone export: invoking native VTK rendering in marimo's worker thread can
 abort Python on macOS. The `-static-3d true` export argument
 is required: marimo's execution mode alone does not identify ipynb exports.
